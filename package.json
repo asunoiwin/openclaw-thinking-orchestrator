@@ -1,0 +1,16 @@
+{
+  "name": "openclaw-thinking-orchestrator",
+  "version": "1.0.0",
+  "description": "Thinking policy orchestration for OpenClaw agents and models",
+  "private": true,
+  "type": "commonjs",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node tests/smoke.test.js"
+  },
+  "openclaw": {
+    "extensions": [
+      "./src/index.js"
+    ]
+  }
+}

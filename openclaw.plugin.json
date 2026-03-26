@@ -1,0 +1,46 @@
+{
+  "id": "openclaw-thinking-orchestrator",
+  "name": "OpenClaw Thinking Orchestrator",
+  "version": "1.0.0",
+  "description": "Applies per-agent and per-model thinking policies before each run, with auto heuristics, floors, and bounds.",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "defaultMode": {
+        "type": "string",
+        "default": "auto"
+      },
+      "defaultLevel": {
+        "type": "string",
+        "default": "low"
+      },
+      "minimumLevel": {
+        "type": "string",
+        "default": "off"
+      },
+      "maximumLevel": {
+        "type": "string"
+      },
+      "respectExplicitThinkDirective": {
+        "type": "boolean",
+        "default": true
+      },
+      "previewFile": {
+        "type": "string"
+      },
+      "autoPolicy": {
+        "type": "object"
+      },
+      "agentRules": {
+        "type": "object"
+      },
+      "modelRules": {
+        "type": "object"
+      }
+    }
+  }
+}
