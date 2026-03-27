@@ -106,13 +106,18 @@ function resolveConfigAgentModel(cfg, agentId) {
 
 function getRule(ruleSet, key) {
   if (!ruleSet || typeof ruleSet !== 'object' || !key) return null;
-  if (ruleSet[key]) return ruleSet[key];
+  if (Object.prototype.hasOwnProperty.call(ruleSet, key)) return ruleSet[key];
   const target = String(key).toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(ruleSet, target)) return ruleSet[target];
   for (const [ruleKey, ruleValue] of Object.entries(ruleSet)) {
     const candidate = String(ruleKey || '').toLowerCase();
     if (!candidate) continue;
     if (candidate === target) return ruleValue;
-    if (target.includes(candidate)) return ruleValue;
+    if (candidate === '*' || candidate === 'default' || candidate === 'other') return ruleValue;
+    if (candidate.endsWith('*')) {
+      const prefix = candidate.slice(0, -1);
+      if (prefix && target.startsWith(prefix)) return ruleValue;
+    }
   }
   return null;
 }

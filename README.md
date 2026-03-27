@@ -96,6 +96,22 @@ Example:
 }
 ```
 
+## Rule matching
+
+Rule lookup is intentionally conservative.
+
+Matching order:
+- exact key match
+- lowercase exact key match
+- `*`
+- `default`
+- `other`
+- prefix wildcard such as `bltcy/*`
+
+It no longer uses broad substring matching.
+
+This matters because broad substring matching can silently apply the wrong model rule.
+
 ## Config fields
 
 ### Top-level plugin config
@@ -133,6 +149,8 @@ Example:
 - `modelRules`
   - Object keyed by full model reference such as `provider/model-id`.
   - Used to express provider capability bounds.
+  - Prefer exact keys.
+  - If you want a provider-wide rule, use a prefix wildcard such as `bltcy/*`.
 
 - `autoPolicy`
   - Optional keyword policy object.

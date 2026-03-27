@@ -88,11 +88,29 @@
 
 - `modelRules`
   - 按模型设置策略。
+  - 建议优先使用完整模型名精确匹配。
+  - 如果想按 provider 整体限制，使用前缀通配，例如：`bltcy/*`
 
 - `autoPolicy`
   - 可选。
   - 如果不写，默认从项目文件读取：
     - [/Users/rico/.openclaw/extensions/openclaw-thinking-orchestrator/src/default-auto-policy.json](/Users/rico/.openclaw/extensions/openclaw-thinking-orchestrator/src/default-auto-policy.json)
+
+## 规则匹配方式
+
+当前匹配顺序是：
+- 精确 key
+- 小写后的精确 key
+- `*`
+- `default`
+- `other`
+- 前缀通配，例如 `bltcy/*`
+
+当前实现已经不再使用宽泛的字符串包含匹配。
+
+这样做的原因是：
+- 宽泛 `includes` 容易把本来属于 A 模型的规则错误套到 B 模型上
+- 模型一多，配置会变得不可预测
 
 ### `agentRules` / `modelRules` 中的字段
 
