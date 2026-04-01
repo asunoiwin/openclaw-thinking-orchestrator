@@ -1,13 +1,17 @@
 # OpenClaw Thinking Orchestrator
 
-Per-run thinking policy orchestration for OpenClaw.
+Merged execution orchestration for OpenClaw.
 
 Chinese documentation:
 - [README.zh-CN.md](/Users/rico/.openclaw/extensions/openclaw-thinking-orchestrator/README.zh-CN.md)
 
 ## Purpose
 
-This plugin sets the session thinking level before execution starts.
+This plugin now merges the old goal-compiler behavior into the thinking layer.
+
+It does two things:
+- sets the session thinking level before execution starts
+- injects a compact execution brief for main-agent tasks
 
 It supports:
 - Global default policy
@@ -15,6 +19,8 @@ It supports:
 - Per-model policy
 - Automatic level selection (`auto`)
 - Hard model limits through `allowedLevels` or `only`
+- Compact goal compilation for the main agent
+- A second preview file for the merged execution brief
 
 ## Supported values
 
@@ -71,8 +77,11 @@ Example:
           "defaultMode": "auto",
           "defaultLevel": "medium",
           "minimumLevel": "off",
+          "injectGoalBrief": true,
+          "goalMaxConstraints": 6,
           "respectExplicitThinkDirective": true,
           "previewFile": "/Users/rico/.openclaw/workspace/.openclaw/thinking-orchestrator-preview.json",
+          "goalPreviewFile": "/Users/rico/.openclaw/workspace/.openclaw/goal-compiler-preview.json",
           "agentRules": {
             "main": {
               "mode": "medium"

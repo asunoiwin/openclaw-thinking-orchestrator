@@ -2,7 +2,7 @@
   "id": "openclaw-thinking-orchestrator",
   "name": "OpenClaw Thinking Orchestrator",
   "version": "1.0.0",
-  "description": "Applies per-agent and per-model thinking policies before each run, with auto heuristics, floors, and bounds.",
+  "description": "Merged execution orchestrator: applies thinking policies and injects a compact execution brief for main-agent tasks.",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -18,6 +18,14 @@
         "type": "string",
         "default": "low"
       },
+      "injectGoalBrief": {
+        "type": "boolean",
+        "default": true
+      },
+      "goalMaxConstraints": {
+        "type": "number",
+        "default": 6
+      },
       "minimumLevel": {
         "type": "string",
         "default": "off"
@@ -30,6 +38,9 @@
         "default": true
       },
       "previewFile": {
+        "type": "string"
+      },
+      "goalPreviewFile": {
         "type": "string"
       },
       "autoPolicy": {

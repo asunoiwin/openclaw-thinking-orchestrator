@@ -1,12 +1,17 @@
 # OpenClaw Thinking Orchestrator
 
-这个插件用于在任务真正执行前，按 `agent + model + prompt` 计算本轮 session 的 `thinking level`。
+这个插件现在是合并后的执行编排插件。
 
-目标不是简单覆盖 `/think`，而是把思考强度做成可控策略：
+它在任务真正执行前做两件事：
+- 按 `agent + model + prompt` 计算本轮 session 的 `thinking level`
+- 给主 agent 注入精简的执行摘要
+
+目标不是简单覆盖 `/think`，而是把思考强度和执行约束统一收口：
 - 可以按 agent 固定等级
 - 可以按模型限制等级范围
 - 可以让 `auto` 根据任务内容自动判断
 - 可以防止模型被设到自己根本不支持的等级
+- 可以吸收原 `openclaw-goal-compiler` 的目标摘要能力
 
 ## 配置文件位置
 
@@ -47,8 +52,11 @@
   "defaultMode": "auto",
   "defaultLevel": "medium",
   "minimumLevel": "off",
+  "injectGoalBrief": true,
+  "goalMaxConstraints": 6,
   "respectExplicitThinkDirective": true,
   "previewFile": "/Users/rico/.openclaw/workspace/.openclaw/thinking-orchestrator-preview.json",
+  "goalPreviewFile": "/Users/rico/.openclaw/workspace/.openclaw/goal-compiler-preview.json",
   "agentRules": {},
   "modelRules": {}
 }
