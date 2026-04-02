@@ -109,7 +109,9 @@ function shouldSkipGoal(prompt) {
   if (!prompt) return true;
   if (/\[Subagent Context\]|\[Subagent Task\]:|^# Role:/m.test(prompt)) return true;
   if (/^\[cron:[^\]]+\]/m.test(prompt)) return true;
+  if (/^System:/m.test(prompt)) return true;
   if (/你是任务巡检员|你是每日任务汇总助手|你是多 agent 编排调度器/.test(prompt)) return true;
+  if (isInternalControlPayload(prompt)) return true;
   return false;
 }
 
@@ -120,14 +122,39 @@ function linesOf(prompt) {
     .filter(Boolean);
 }
 
+function stripInternalControlBlocks(text) {
+  let cleaned = String(text || '');
+  const blockPatterns = [
+    /(?:^|\n)Multi-agent routing decision:[\s\S]*?(?=\n(?:Sender \(untrusted metadata\):|Conversation info \(untrusted metadata\):|Relevant memory:|Current time:|Read HEARTBEAT\.md|When reading HEARTBEAT\.md|$))/gi,
+    /(?:^|\n)Execution brief:[\s\S]*?(?=\n(?:Search orchestration guidance:|Sender \(untrusted metadata\):|Conversation info \(untrusted metadata\):|Relevant memory:|Current time:|Read HEARTBEAT\.md|When reading HEARTBEAT\.md|$))/gi,
+    /(?:^|\n)Search orchestration guidance:[\s\S]*?(?=\n(?:Sender \(untrusted metadata\):|Conversation info \(untrusted metadata\):|Relevant memory:|Current time:|Read HEARTBEAT\.md|When reading HEARTBEAT\.md|$))/gi,
+  ];
+  for (const pattern of blockPatterns) {
+    cleaned = cleaned.replace(pattern, '\n');
+  }
+  return cleaned;
+}
+
+function isInternalControlPayload(text) {
+  const normalized = String(text || '').trim();
+  if (!normalized) return false;
+  if (/^System:/mi.test(normalized)) return true;
+  if (/Sender \(untrusted metadata\):[\s\S]*openclaw-control-ui/i.test(normalized)) return true;
+  if (/^Multi-agent routing decision:/mi.test(normalized)) return true;
+  if (/^Execution brief:/mi.test(normalized)) return true;
+  if (/^Search orchestration guidance:/mi.test(normalized)) return true;
+  return false;
+}
+
 function stripSystemNoise(text) {
-  return String(text || '')
+  return stripInternalControlBlocks(String(text || ''))
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean)
     .filter((line) => {
       if (/^Relevant memory/i.test(line)) return false;
       if (/^Current time:/i.test(line)) return false;
+      if (/^System:/i.test(line)) return false;
       if (/^Read HEARTBEAT\.md/i.test(line)) return false;
       if (/^Conversation info \(untrusted metadata\):/i.test(line)) return false;
       if (/^Sender \(untrusted metadata\):/i.test(line)) return false;
@@ -243,7 +270,7 @@ function formatExecutionBrief(goal) {
   if (goal.outputPaths.length) lines.push(`- 输出路径：${goal.outputPaths.join(' | ')}`);
   if (goal.searchPlan.length) lines.push(`- 检索策略：${goal.searchPlan.join(' | ')}`);
   if (goal.taskKind === 'search' || goal.taskKind === 'research' || goal.taskKind === 'skill_discovery') {
-    lines.push('- 优先工具：search_orchestrator_research -> search_orchestrator_extract');
+    lines.push('- 优先工具：websearch_pro_research -> websearch_pro_extract');
   }
   for (const step of goal.executionPlan || []) lines.push(`- 步骤：${step}`);
   return lines.join('\n');
@@ -536,6 +563,8 @@ plugin.__private = {
   formatExecutionBrief,
   promptFingerprint,
   isGoalInjectionEnabled,
+  stripInternalControlBlocks,
+  isInternalControlPayload,
 };
 
 module.exports = plugin;
