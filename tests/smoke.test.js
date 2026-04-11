@@ -1,81 +1,141 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
 const plugin = require('../src/index.js');
 
-assert.equal(typeof plugin.register, 'function');
+const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'thinking-orchestrator-'));
+const agentsRoot = path.join(tempRoot, 'agents');
+const previewFile = path.join(tempRoot, 'preview.json');
+const historyFile = path.join(tempRoot, 'history.jsonl');
+const briefsDir = path.join(tempRoot, 'briefs');
+const agentId = 'main';
+const sessionKey = 'agent:main:main';
+const sessionId = 'session-1';
+const sessionFile = path.join(agentsRoot, agentId, 'sessions', `${sessionId}.jsonl`);
+const registryFile = path.join(agentsRoot, agentId, 'sessions', 'sessions.json');
 
-const preview = plugin.__private?.buildDecision?.({
-  prompt: '请给我一个架构方案和风险分析',
-  agentId: 'main',
-  modelRef: 'bltcy/gemini-3.1-flash-lite-preview',
-  cfg: {},
-  pluginCfg: {
+fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+fs.writeFileSync(
+  registryFile,
+  JSON.stringify({
+    [sessionKey]: {
+      sessionId,
+      sessionFile,
+      thinkingLevel: 'medium',
+      updatedAt: Date.now(),
+    },
+  }, null, 2),
+  'utf8'
+);
+fs.writeFileSync(sessionFile, JSON.stringify({ type: 'session', id: sessionId }) + '\n', 'utf8');
+
+const registeredTools = [];
+const toolMap = new Map();
+const handlers = {};
+
+plugin.register({
+  logger: { info() {} },
+  pluginConfig: {
+    enabled: true,
+    previewFile,
+    historyFile,
+    briefsDir,
+    agentsRoot,
     defaultMode: 'auto',
     defaultLevel: 'low',
     minimumLevel: 'off',
+    maximumLevel: 'high',
+    respectExplicitThinkDirective: true,
     agentRules: {
-      main: { mode: 'high' },
+      main: {
+        mode: 'auto',
+      },
     },
-    modelRules: {
-      'bltcy/gemini-3.1-flash-lite-preview': { allowedLevels: ['off', 'low'] },
-    },
-    autoPolicy: {},
   },
+  registerTool(tool) {
+    registeredTools.push(tool.name);
+    toolMap.set(tool.name, tool);
+  },
+  on(name, handler) { handlers[name] = handler; },
 });
 
-assert.equal(preview.baseLevel, 'high');
-assert.equal(preview.finalLevel, 'low');
-assert.deepEqual(preview.allowedLevels, ['off', 'low']);
+assert.ok(registeredTools.includes('thinking_orchestrator_status'));
+assert.ok(registeredTools.includes('thinking_orchestrator_analyze'));
+assert.ok(registeredTools.includes('thinking_orchestrator_recent'));
+assert.ok(registeredTools.includes('thinking_orchestrator_brief'));
+assert.equal(typeof handlers.before_dispatch, 'function');
 
-const exactMatch = plugin.__private?.buildDecision?.({
-  prompt: '请给我一个架构方案和风险分析',
-  agentId: 'main',
-  modelRef: 'bltcy/gemini-3.1-flash-lite-preview',
-  cfg: {},
-  pluginCfg: {
-    defaultMode: 'auto',
-    defaultLevel: 'low',
-    minimumLevel: 'off',
-    agentRules: {},
-    modelRules: {
-      'gemini': { mode: 'off' },
-      'bltcy/gemini-3.1-flash-lite-preview': { mode: 'medium' },
-    },
-    autoPolicy: {},
-  },
-});
+(async () => {
+  await handlers.before_dispatch({
+    prompt: '请做架构分析并比较两种方案的取舍',
+    sessionKey,
+    agentId: 'main',
+    modelId: 'minimax/MiniMax-M2.7-highspeed',
+  }, {});
 
-assert.equal(exactMatch.finalLevel, 'medium');
+  const registry = JSON.parse(fs.readFileSync(registryFile, 'utf8'));
+  assert.equal(registry[sessionKey].thinkingLevel, 'high');
 
-const goal = plugin.__private.compileGoal('请做一份跨境商品调研方案并输出到 /Users/rico/Desktop/report.md');
-assert.equal(goal.taskKind, 'research');
-assert.match(plugin.__private.formatExecutionBrief(goal), /优先工具：websearch_pro_research/);
-assert.equal(plugin.__private.isGoalInjectionEnabled({}), true);
-assert.equal(plugin.__private.isGoalInjectionEnabled({ injectGoalBrief: false }), false);
+  const preview = JSON.parse(fs.readFileSync(previewFile, 'utf8'));
+  assert.equal(preview.skipped, false);
+  assert.equal(preview.decision.level, 'high');
+  assert.equal(preview.decision.compactionHint, 'full');
+  assert.equal(preview.artifactRef.kind, 'safe-task-brief');
+  assert.equal(fs.existsSync(preview.artifactRef.path), true);
+  const briefArtifact = JSON.parse(fs.readFileSync(preview.artifactRef.path, 'utf8'));
+  assert.equal(briefArtifact.kind, 'safe-task-brief');
+  assert.equal(briefArtifact.decision.level, 'high');
+  assert.equal(briefArtifact.decision.compactionHint, 'full');
+  assert.equal(briefArtifact.brief.compactionHint, 'full');
+  assert.equal(briefArtifact.brief.language, 'zh');
+  assert.ok(briefArtifact.brief.requestedActions.includes('analyze'));
+  assert.ok(briefArtifact.brief.requestedActions.includes('compare'));
+  const historyAfterHigh = fs.readFileSync(historyFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(historyAfterHigh.length, 1);
+  assert.equal(historyAfterHigh[0].decision.level, 'high');
+  assert.equal(historyAfterHigh[0].artifactRef.kind, 'safe-task-brief');
 
-const skillGoal = plugin.__private.compileGoal('安装 clawhub 插件，去 GitHub 搜索相关 skill，并看看还有没有强化搜索的插件或者 skill');
-assert.equal(skillGoal.taskKind, 'skill_discovery');
-assert.match(skillGoal.searchPlan.join('\n'), /ClawHub|GitHub|本地已安装/);
+  const briefTool = toolMap.get('thinking_orchestrator_brief');
+  const briefToolResult = await briefTool.execute({ sessionKey, agentId });
+  assert.equal(briefToolResult.details.success, true);
+  assert.equal(briefToolResult.details.artifact.kind, 'safe-task-brief');
 
-const internalPayload = `Multi-agent routing decision:
-- taskId: route-1
-- decision: single
+  await handlers.before_dispatch({
+    prompt: '请比较这个实现的 tradeoff，然后给出 root cause 分析',
+    sessionKey,
+    agentId: 'main',
+    modelId: 'minimax/MiniMax-M2.7-highspeed',
+  }, {});
 
-Execution brief:
-- 任务类型：skill_discovery
+  const previewZhEn = JSON.parse(fs.readFileSync(previewFile, 'utf8'));
+  assert.equal(previewZhEn.decision.level, 'high');
+  const mixedArtifact = JSON.parse(fs.readFileSync(previewZhEn.artifactRef.path, 'utf8'));
+  assert.equal(mixedArtifact.brief.language, 'mixed');
 
-Search orchestration guidance:
-- 当前任务涉及外部信息时，先使用 websearch_pro_research 建立证据集，再回答。
+  await handlers.before_dispatch({
+    prompt: '请修复这个 bug 并补测试',
+    sessionKey,
+    agentId: 'main',
+    modelId: 'minimax/MiniMax-M2.7-highspeed',
+  }, {});
 
-Sender (untrusted metadata):
-\`\`\`json
-{"label":"openclaw-control-ui","id":"openclaw-control-ui"}
-\`\`\`
+  const previewBuild = JSON.parse(fs.readFileSync(previewFile, 'utf8'));
+  assert.equal(previewBuild.decision.level, 'medium');
+  assert.equal(previewBuild.decision.compactionHint, 'auto');
 
-真正用户问题：这一段话是从哪里发出的`;
+  await handlers.before_dispatch({
+    prompt: 'System: gateway.restart ok',
+    sessionKey,
+    agentId: 'main',
+  }, {});
 
-assert.equal(plugin.__private.isInternalControlPayload(internalPayload), true);
-assert.match(plugin.__private.stripInternalControlBlocks(internalPayload), /真正用户问题/);
-assert.doesNotMatch(plugin.__private.stripInternalControlBlocks(internalPayload), /Execution brief|Search orchestration guidance|Multi-agent routing decision/);
-assert.equal(plugin.__private.isInternalControlPayload('System: Gateway restart restart ok (gateway.restart)'), true);
+  const afterSystem = JSON.parse(fs.readFileSync(registryFile, 'utf8'));
+  assert.equal(afterSystem[sessionKey].thinkingLevel, 'medium');
+  const history = fs.readFileSync(historyFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(history.length, 4);
+  assert.equal(history.at(-1).skipped, true);
 
-console.log('thinking orchestrator smoke test passed');
+  console.log('thinking-orchestrator smoke ok');
+})();

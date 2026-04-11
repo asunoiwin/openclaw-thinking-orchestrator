@@ -1,39 +1,27 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
-let runtime = {};
-try {
-  runtime = require('/opt/homebrew/lib/node_modules/openclaw/dist/plugin-sdk/config-runtime.js');
-} catch {
-  runtime = {};
-}
-
+// Import dynamic degradation module
 const {
-  loadConfig = () => ({}),
-  resolveStorePath = () => null,
-  updateSessionStore = async () => ({ updated: false, reason: 'runtime-unavailable' }),
-} = runtime;
-
-const DEFAULT_AUTO_POLICY = require('./default-auto-policy.json');
+  makeDynamicDecision,
+  formatDegradeLog,
+  DEFAULT_BUDGET_CONFIG,
+} = require('./dynamic-degrade.js');
 
 const HOME = os.homedir();
-const WORKSPACE = path.join(HOME, '.openclaw', 'workspace', '.openclaw');
-const DEFAULT_THINKING_PREVIEW = path.join(WORKSPACE, 'thinking-orchestrator-preview.json');
-const DEFAULT_GOAL_PREVIEW = path.join(WORKSPACE, 'goal-compiler-preview.json');
-const THINK_LEVELS = ['off', 'low', 'medium', 'high'];
-const SUPPORTED_LEVELS = new Set(['off', 'low', 'medium', 'high', 'auto']);
+const DEFAULT_PREVIEW = path.join(HOME, '.openclaw', 'workspace', '.openclaw', 'thinking-orchestrator-preview.json');
+const DEFAULT_HISTORY = path.join(HOME, '.openclaw', 'workspace', '.openclaw', 'thinking-orchestrator-history.jsonl');
+const DEFAULT_BRIEFS_DIR = path.join(HOME, '.openclaw', 'workspace', '.openclaw', 'thinking-orchestrator-briefs');
+const DEFAULT_AGENTS_ROOT = path.join(HOME, '.openclaw', 'agents');
+const LEVELS = ['off', 'low', 'medium', 'high'];
 
 function ensureDir(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
 }
 
-function writeJson(file, value) {
-  ensureDir(file);
-  fs.writeFileSync(file, JSON.stringify(value, null, 2), 'utf8');
-}
-
-function readJson(file, fallback) {
+function readJson(file, fallback = null) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch {
@@ -41,530 +29,654 @@ function readJson(file, fallback) {
   }
 }
 
-function normalizeLevel(value, fallback = null) {
-  const raw = String(value || '').trim().toLowerCase();
-  if (!raw) return fallback;
-  if (raw === 'minimal') return 'low';
-  if (raw === 'xhigh') return 'high';
-  if (raw === 'adaptive') return 'medium';
-  return THINK_LEVELS.includes(raw) ? raw : fallback;
+function writeJsonAtomic(file, value) {
+  ensureDir(file);
+  // Use crypto.randomUUID for unique temp file to avoid collisions
+  const temp = `${file}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(temp, JSON.stringify(value, null, 2), 'utf8');
+    fs.renameSync(temp, file);
+  } catch (writeErr) {
+    // Clean up temp file on failure
+    try { fs.unlinkSync(temp); } catch {}
+    throw writeErr;
+  }
 }
 
-function normalizeMode(value, fallback = 'auto') {
-  const raw = String(value || '').trim().toLowerCase();
-  if (!raw) return fallback;
-  return SUPPORTED_LEVELS.has(raw) ? raw : fallback;
+function randomId() {
+  return crypto.randomBytes(4).toString('hex');
 }
 
-function levelIndex(level) {
-  return THINK_LEVELS.indexOf(normalizeLevel(level, 'off'));
+function hashText(value) {
+  return crypto.createHash('sha1').update(String(value || '')).digest('hex');
 }
 
-function clampLevel(level, minLevel, maxLevel) {
-  const candidate = levelIndex(level);
-  const minIndex = minLevel ? levelIndex(minLevel) : 0;
-  const maxIndex = maxLevel ? levelIndex(maxLevel) : THINK_LEVELS.length - 1;
-  if (minIndex > maxIndex) return THINK_LEVELS[maxIndex];
-  const clamped = Math.max(minIndex, Math.min(candidate, maxIndex));
-  return THINK_LEVELS[clamped];
+function safeSlug(value, fallback = 'unknown') {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  return normalized || fallback;
 }
 
-function normalizeLevelList(values) {
-  if (!Array.isArray(values)) return [];
-  return values
-    .map((value) => normalizeLevel(value, null))
-    .filter(Boolean)
-    .filter((value, index, list) => list.indexOf(value) === index)
-    .sort((a, b) => levelIndex(a) - levelIndex(b));
+function normalizeWhitespace(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
-function resolveEventAgentId(event, ctx) {
-  const direct = String(ctx?.agentId || event?.agentId || '').trim();
-  if (direct) return direct;
-  const nested = String(event?.agent?.id || event?.agent?.name || event?.context?.agentId || '').trim();
-  if (nested) return nested;
-  const sessionKey = String(ctx?.sessionKey || event?.sessionKey || event?.session || '').trim();
-  const match = sessionKey.match(/^agent:([^:]+):/);
-  return match?.[1] || 'main';
+function normalizeLevel(value, fallback = 'low') {
+  const normalized = String(value || '').toLowerCase().trim();
+  return LEVELS.includes(normalized) ? normalized : fallback;
 }
 
-function resolveSessionKey(event, ctx) {
-  return String(ctx?.sessionKey || event?.sessionKey || event?.session || '').trim();
+function levelIndex(value) {
+  return LEVELS.indexOf(normalizeLevel(value));
+}
+
+function clampLevel(level, minimumLevel = 'off', maximumLevel = 'high') {
+  const rawIndex = levelIndex(level);
+  const minIndex = levelIndex(minimumLevel);
+  const maxIndex = levelIndex(maximumLevel);
+  const bounded = Math.max(minIndex, Math.min(maxIndex, rawIndex));
+  return LEVELS[bounded];
+}
+
+function pickMoreIntense(a, b) {
+  return levelIndex(a) >= levelIndex(b) ? a : b;
 }
 
 function getPromptText(event) {
   return String(event?.prompt || '').trim();
 }
 
-function getDispatchText(event) {
-  return String(event?.body || event?.content || '').trim();
+function resolveAgentId(event, ctx) {
+  const direct = String(event?.agentId || ctx?.agentId || '').trim();
+  if (direct) return direct;
+  const nested = String(
+    event?.agent?.id ||
+    event?.agent?.name ||
+    event?.context?.agentId ||
+    ctx?.agent?.id ||
+    ctx?.agent?.name ||
+    ''
+  ).trim();
+  if (nested) return nested;
+  const sessionKey = resolveSessionKey(event, ctx);
+  const match = sessionKey.match(/^agent:([^:]+):/);
+  return match?.[1] || 'main';
 }
 
-function hasExplicitThinkDirective(prompt) {
+function resolveSessionKey(event, ctx) {
+  return String(event?.sessionKey || ctx?.sessionKey || event?.session || '').trim();
+}
+
+function resolveModelId(event, ctx) {
+  return String(
+    event?.model ||
+    event?.modelId ||
+    ctx?.model ||
+    ctx?.modelId ||
+    ctx?.activeModel ||
+    ''
+  ).trim();
+}
+
+function isInternalControlPrompt(prompt, sessionKey = '') {
   const text = String(prompt || '');
-  return /\/think(?::|\s+)(off|minimal|low|medium|high|xhigh|adaptive)\b/i.test(text);
+  if (!text) return true;
+  const patterns = [
+    /^System:/im,
+    /^HEARTBEAT(?:_OK)?$/im,
+    /Read HEARTBEAT\.md if it exists/im,
+    /Current time:/im,
+    /\[cron:[^\]]+\]/im,
+    /gateway\.restart/im,
+    /openclaw doctor --non-interactive/im,
+    /Multi-agent routing decision:/im,
+    /Execution brief:/im,
+    /Search orchestration guidance:/im,
+    /Relevant memory \(minimal\):/im,
+    /Sender \(untrusted metadata\):/im,
+    /Conversation info \(untrusted metadata\):/im,
+    /before_agent_start/im,
+    /openclaw-control-ui/im,
+  ];
+  if (patterns.some((pattern) => pattern.test(text))) return true;
+  return /:cron:|:heartbeat$|:subagent:/.test(sessionKey);
 }
 
-function shouldSkipGoal(prompt) {
-  if (!prompt) return true;
-  if (/\[Subagent Context\]|\[Subagent Task\]:|^# Role:/m.test(prompt)) return true;
-  if (/^\[cron:[^\]]+\]/m.test(prompt)) return true;
-  if (/^System:/m.test(prompt)) return true;
-  if (/你是任务巡检员|你是每日任务汇总助手|你是多 agent 编排调度器/.test(prompt)) return true;
-  if (isInternalControlPayload(prompt)) return true;
-  return false;
+function hasExplicitDirective(prompt) {
+  const text = String(prompt || '');
+  if (/\b(think hard|deeply think|think deeper|deeper analysis|carefully reason|step by step|systematic analysis)\b/i.test(text)) {
+    return 'high';
+  }
+  if (/\b(quick answer|no need to think|don't overthink|just answer|brief answer only|reply ok only)\b/i.test(text)) {
+    return 'off';
+  }
+  return '';
 }
 
-function linesOf(prompt) {
-  return String(prompt || '')
+function classifyPrompt(prompt) {
+  const text = String(prompt || '').trim();
+  const lower = text.toLowerCase();
+  const reasons = [];
+
+  if (!text) {
+    return { level: 'off', kind: 'empty', reasons: ['empty_prompt'] };
+  }
+
+  if (/(架构|architecture|设计方案|tradeoff|取舍|review|审查|研究|research|compare|对比|分析|root cause|根因|审计)/i.test(lower)) {
+    reasons.push('high_signal_research_or_design');
+    return { level: 'high', kind: 'analysis', reasons };
+  }
+
+  if (/(实现|implement|fix|修复|debug|测试|test|refactor|重构|编码|写代码|patch)/i.test(lower)) {
+    reasons.push('medium_signal_build_work');
+    return { level: 'medium', kind: 'build', reasons };
+  }
+
+  if (/\n\s*(1\.|- |\* )/.test(text) || /[。.!?]\s+[A-Z\u4e00-\u9fff]/.test(text) || text.length > 500) {
+    reasons.push('structured_or_long_prompt');
+    return { level: 'medium', kind: 'structured', reasons };
+  }
+
+  if (/^(ok|okay|收到|明白|继续|继续做|go on|status|yes|no)[.!]?$/i.test(text) || text.length <= 12) {
+    return { level: 'off', kind: 'trivial', reasons: ['trivial_ack'] };
+  }
+
+  reasons.push('default_auto_fallback');
+  return { level: 'low', kind: 'general', reasons };
+}
+
+function detectLanguage(prompt) {
+  const text = String(prompt || '');
+  const hasZh = /[\u4e00-\u9fff]/.test(text);
+  const hasEn = /[a-z]/i.test(text);
+  if (hasZh && hasEn) return 'mixed';
+  if (hasZh) return 'zh';
+  if (hasEn) return 'en';
+  return 'unknown';
+}
+
+function collectKeywordMatches(text, groups) {
+  const found = [];
+  for (const [name, pattern] of groups) {
+    if (pattern.test(text)) found.push(name);
+  }
+  return found;
+}
+
+function inferRequestedActions(prompt) {
+  return collectKeywordMatches(String(prompt || ''), [
+    ['analyze', /(分析|analy[sz]e|architecture|设计方案|root cause|根因)/i],
+    ['compare', /(compare|对比|tradeoff|取舍)/i],
+    ['review', /(review|审查|评审|audit|审计)/i],
+    ['implement', /(实现|implement|build|编码|写代码)/i],
+    ['fix', /(修复|fix|bug)/i],
+    ['debug', /(debug|排查|定位)/i],
+    ['test', /(测试|test|spec)/i],
+    ['refactor', /(refactor|重构)/i],
+    ['summarize', /(总结|summary|summari[sz]e|汇总)/i],
+  ]);
+}
+
+function inferDeliverables(prompt) {
+  return collectKeywordMatches(String(prompt || ''), [
+    ['code', /(代码|code|patch|implement|fix|refactor)/i],
+    ['tests', /(测试|test|spec)/i],
+    ['summary', /(总结|summary|汇总)/i],
+    ['report', /(报告|report|review)/i],
+    ['json', /(json|结构化|只输出)/i],
+    ['plan', /(计划|plan|下一步|todo)/i],
+  ]);
+}
+
+function inferConstraints(prompt) {
+  const lines = String(prompt || '')
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
+  return lines.filter((line) => (
+    /^(不要|别|请勿|do not|don't|only|must|只|仅|务必)/i.test(line) ||
+    /只输出|不要输出|不创建|不切换|忽略/i.test(line)
+  )).slice(0, 8);
 }
 
-function stripInternalControlBlocks(text) {
-  let cleaned = String(text || '');
-  const blockPatterns = [
-    /(?:^|\n)Multi-agent routing decision:[\s\S]*?(?=\n(?:Sender \(untrusted metadata\):|Conversation info \(untrusted metadata\):|Relevant memory:|Current time:|Read HEARTBEAT\.md|When reading HEARTBEAT\.md|$))/gi,
-    /(?:^|\n)Execution brief:[\s\S]*?(?=\n(?:Search orchestration guidance:|Sender \(untrusted metadata\):|Conversation info \(untrusted metadata\):|Relevant memory:|Current time:|Read HEARTBEAT\.md|When reading HEARTBEAT\.md|$))/gi,
-    /(?:^|\n)Search orchestration guidance:[\s\S]*?(?=\n(?:Sender \(untrusted metadata\):|Conversation info \(untrusted metadata\):|Relevant memory:|Current time:|Read HEARTBEAT\.md|When reading HEARTBEAT\.md|$))/gi,
-  ];
-  for (const pattern of blockPatterns) {
-    cleaned = cleaned.replace(pattern, '\n');
-  }
-  return cleaned;
-}
-
-function isInternalControlPayload(text) {
-  const normalized = String(text || '').trim();
-  if (!normalized) return false;
-  if (/^System:/mi.test(normalized)) return true;
-  if (/Sender \(untrusted metadata\):[\s\S]*openclaw-control-ui/i.test(normalized)) return true;
-  if (/^Multi-agent routing decision:/mi.test(normalized)) return true;
-  if (/^Execution brief:/mi.test(normalized)) return true;
-  if (/^Search orchestration guidance:/mi.test(normalized)) return true;
-  return false;
-}
-
-function stripSystemNoise(text) {
-  return stripInternalControlBlocks(String(text || ''))
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .filter((line) => {
-      if (/^Relevant memory/i.test(line)) return false;
-      if (/^Current time:/i.test(line)) return false;
-      if (/^System:/i.test(line)) return false;
-      if (/^Read HEARTBEAT\.md/i.test(line)) return false;
-      if (/^Conversation info \(untrusted metadata\):/i.test(line)) return false;
-      if (/^Sender \(untrusted metadata\):/i.test(line)) return false;
-      if (/^Multi-agent routing decision:/i.test(line)) return false;
-      if (/^HEARTBEAT$/i.test(line)) return false;
-      if (/^Tool output/i.test(line)) return false;
-      return true;
-    })
-    .join('\n');
-}
-
-function extractPaths(text) {
-  const matches = String(text).match(/\/Users\/[^\s"'`]+/g) || [];
-  return [...new Set(matches)].slice(0, 6);
-}
-
-function scoreLine(line) {
-  let score = 0;
-  if (/不要|不能|禁止|只要|只需|只返回|必须|优先|直接|闭环|不要停/.test(line)) score += 3;
-  if (/报告|文档|表格|方案|总结|脚本|插件|仓库|测试|验收|输出|保存|生成/.test(line)) score += 2;
-  if (/写到|放到|路径|桌面|workspace|markdown|md|xlsx|csv|json/.test(line)) score += 2;
-  return score;
-}
-
-function extractDeliverable(lines) {
-  const ranked = [...lines]
-    .sort((a, b) => scoreLine(b) - scoreLine(a))
-    .filter((line) => scoreLine(line) > 0);
-  return ranked[0] || lines[0] || '';
-}
-
-function extractConstraints(lines, maxConstraints) {
-  const picked = [];
-  for (const line of lines) {
-    if (/不要|不能|禁止|只要|只需|只返回|必须|优先|直接|闭环|不要停/.test(line)) picked.push(line);
-    if (picked.length >= maxConstraints) break;
-  }
-  return picked;
-}
-
-function classifyTask(text) {
-  if (/clawhub|skill|skills|插件|plugin|github|仓库搜索|找技能|find-skills/i.test(text)) return 'skill_discovery';
-  if (/小红书|抖音|知乎|reddit|rebbit|google|百度|github|clawhub|官网|文档/.test(text)) return 'search';
-  if (/调研|专利|亚马逊|卖家精灵|竞品|评论|关键词|舆情|商品/.test(text)) return 'research';
-  if (/修复|报错|bug|异常|故障|泄漏|污染|不工作/.test(text)) return 'fix';
-  if (/搜索|查找|检索|搜一下|看看/.test(text)) return 'search';
-  if (/总结|报告|文档|方案|表格|汇总/.test(text)) return 'report';
-  return 'general';
-}
-
-function buildSearchPlan(text) {
-  const plan = [];
-  if (/clawhub|skill|skills|插件|plugin|github|找技能|find-skills/i.test(text)) {
-    plan.push('先区分是找 OpenClaw skill、插件仓库，还是安装现成能力，不要走泛搜索。');
-    plan.push('优先检查本地已安装 skills 和 ClawHub，再补 GitHub 搜索与仓库 README。');
-    plan.push('输出时要区分：可直接安装、需要手动接入、仅供参考 三类结果。');
-    return plan.slice(0, 3);
-  }
-  if (/社媒|微博|小红书|抖音|b站|知乎/.test(text)) {
-    plan.push('先选平台，再生成结构化证据卡，不直接堆网页结果。');
-  }
-  if (/淘宝|京东|拼多多|闲鱼|得物|美团|携程|亚马逊/.test(text)) {
-    plan.push('商品/电商检索优先保留价格、销量、店铺、评价和筛选条件。');
-  }
-  if (/专利/.test(text)) {
-    plan.push('专利检索优先保留专利号、申请人、法律状态和相似点。');
-  }
-  if (!plan.length) plan.push('先明确待验证结论，再按来源优先级检索并保留证据。');
-  return plan.slice(0, 3);
-}
-
-function buildExecutionPlan(goal) {
-  const steps = [];
-  steps.push(`确认交付物：${goal.deliverable || '按用户最后要求收口'}`);
-  if (goal.taskKind === 'skill_discovery') {
-    steps.push('先检查本地已安装技能与 ClawHub，再补 GitHub 仓库证据。');
-  }
-  if (goal.taskKind === 'search' || goal.taskKind === 'research') {
-    steps.push('先建立结构化证据集，再分析和汇总。');
-  }
-  if (goal.searchPlan?.length) steps.push(`检索策略：${goal.searchPlan.join('；')}`);
-  steps.push('完成后对照目标和约束做自检。');
-  return steps.slice(0, 4);
-}
-
-function compileGoal(prompt, maxConstraints = 6) {
-  const cleanedText = stripSystemNoise(prompt);
-  const cleanedLines = linesOf(cleanedText);
-  const deliverable = extractDeliverable(cleanedLines);
-  const constraints = extractConstraints(cleanedLines, maxConstraints);
-  const outputPaths = extractPaths(cleanedText);
-  const taskKind = classifyTask(cleanedText);
-  const searchPlan = buildSearchPlan(cleanedText);
+function buildSafeTaskBrief(prompt, decision) {
+  const normalized = String(prompt || '').trim();
+  const collapsed = normalizeWhitespace(normalized);
+  const firstLine = normalized.split('\n').map((line) => line.trim()).find(Boolean) || '';
+  const objective = (firstLine || collapsed).slice(0, 220);
   return {
-    generatedAt: new Date().toISOString(),
-    taskKind,
-    deliverable,
-    constraints,
-    outputPaths,
-    searchPlan,
-    executionPlan: buildExecutionPlan({ taskKind, deliverable, searchPlan }),
-    promptPreview: cleanedText.slice(0, 500),
+    objective,
+    language: detectLanguage(normalized),
+    promptLength: normalized.length,
+    workType: decision?.kind || 'general',
+    compactionHint: decision?.compactionHint || 'auto',
+    requestedActions: inferRequestedActions(normalized),
+    deliverables: inferDeliverables(normalized),
+    constraints: inferConstraints(normalized),
   };
 }
 
-function formatExecutionBrief(goal) {
-  const lines = [
-    'Execution brief:',
-    `- 任务类型：${goal.taskKind}`,
-    `- 目标：${goal.deliverable || '按用户最后要求收口'}`,
-  ];
-  if (goal.constraints.length) lines.push(`- 约束：${goal.constraints.join(' | ')}`);
-  if (goal.outputPaths.length) lines.push(`- 输出路径：${goal.outputPaths.join(' | ')}`);
-  if (goal.searchPlan.length) lines.push(`- 检索策略：${goal.searchPlan.join(' | ')}`);
-  if (goal.taskKind === 'search' || goal.taskKind === 'research' || goal.taskKind === 'skill_discovery') {
-    lines.push('- 优先工具：websearch_pro_research -> websearch_pro_extract');
+function getCompactionHint(level) {
+  switch (normalizeLevel(level, 'low')) {
+    case 'off':
+    case 'low':
+      return 'micro';
+    case 'medium':
+      return 'auto';
+    case 'high':
+      return 'full';
+    default:
+      return 'auto';
   }
-  for (const step of goal.executionPlan || []) lines.push(`- 步骤：${step}`);
-  return lines.join('\n');
 }
 
-function promptFingerprint(goal) {
-  return JSON.stringify({
-    taskKind: goal.taskKind,
-    deliverable: goal.deliverable,
-    constraints: goal.constraints,
-    outputPaths: goal.outputPaths,
-  });
+function applyRule(level, rule = {}) {
+  const allowedLevels = Array.isArray(rule?.allowedLevels)
+    ? rule.allowedLevels.map((item) => normalizeLevel(item)).filter(Boolean)
+    : [];
+  let effective = level;
+  if (rule?.mode && rule.mode !== 'auto') {
+    effective = normalizeLevel(rule.mode, effective);
+  }
+  effective = clampLevel(
+    effective,
+    rule?.minimumLevel || 'off',
+    rule?.maximumLevel || 'high'
+  );
+  if (allowedLevels.length && !allowedLevels.includes(effective)) {
+    effective = allowedLevels.sort((a, b) => levelIndex(a) - levelIndex(b))[0];
+  }
+  return effective;
 }
 
-function isGoalInjectionEnabled(pluginConfig = {}) {
-  if (pluginConfig.enabled === false) return false;
-  if (pluginConfig.injectBeforePromptBuild === false) return false;
-  if (pluginConfig.injectGoalBrief === false) return false;
-  return true;
-}
+function buildDecision(prompt, options = {}) {
+  const config = options.config || {};
+  const agentId = String(options.agentId || 'main');
+  const modelId = String(options.modelId || '');
+  const baseMode = String(config.defaultMode || 'auto').trim().toLowerCase();
+  const baseLevel = normalizeLevel(config.defaultLevel || 'low', 'low');
+  const minimumLevel = normalizeLevel(config.minimumLevel || 'off', 'off');
+  const maximumLevel = normalizeLevel(config.maximumLevel || 'high', 'high');
+  const explicit = config.respectExplicitThinkDirective === false ? '' : hasExplicitDirective(prompt);
+  const promptDecision = classifyPrompt(prompt);
 
-function previewFileFor(pluginCfg) {
-  const configured = String(pluginCfg.previewFile || '').trim();
-  return configured || DEFAULT_THINKING_PREVIEW;
-}
+  let level = baseMode === 'auto' ? promptDecision.level : normalizeLevel(baseMode, baseLevel);
+  const reasons = [...promptDecision.reasons];
+  if (baseMode !== 'auto') reasons.push(`default_mode_${baseMode}`);
+  if (explicit) {
+    level = explicit;
+    reasons.push(`explicit_directive_${explicit}`);
+  }
 
-function goalPreviewFileFor(pluginCfg) {
-  const configured = String(pluginCfg.goalPreviewFile || '').trim();
-  return configured || DEFAULT_GOAL_PREVIEW;
-}
+  level = clampLevel(level, minimumLevel, maximumLevel);
 
-function resolveConfigAgentModel(cfg, agentId) {
-  const defaults = cfg?.agents?.defaults || {};
-  const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
-  const found = list.find((item) => String(item?.id || '').trim() === agentId) || null;
-  const model = String(found?.model || defaults?.model?.primary || '').trim();
+  const agentRule = config.agentRules?.[agentId];
+  if (agentRule) {
+    const next = applyRule(level, agentRule);
+    if (next !== level) reasons.push(`agent_rule_${agentId}`);
+    level = next;
+  }
+
+  const modelRule = config.modelRules?.[modelId];
+  if (modelRule) {
+    const next = applyRule(level, modelRule);
+    if (next !== level) reasons.push(`model_rule_${modelId}`);
+    level = next;
+  }
+
   return {
-    model,
-    providerModelRef: model,
-  };
-}
-
-function getRule(ruleSet, key) {
-  if (!ruleSet || typeof ruleSet !== 'object' || !key) return null;
-  if (Object.prototype.hasOwnProperty.call(ruleSet, key)) return ruleSet[key];
-  const target = String(key).toLowerCase();
-  if (Object.prototype.hasOwnProperty.call(ruleSet, target)) return ruleSet[target];
-  for (const [ruleKey, ruleValue] of Object.entries(ruleSet)) {
-    const candidate = String(ruleKey || '').toLowerCase();
-    if (!candidate) continue;
-    if (candidate === target) return ruleValue;
-    if (candidate === '*' || candidate === 'default' || candidate === 'other') return ruleValue;
-    if (candidate.endsWith('*')) {
-      const prefix = candidate.slice(0, -1);
-      if (prefix && target.startsWith(prefix)) return ruleValue;
-    }
-  }
-  return null;
-}
-
-function autoLevelFromPrompt(prompt, autoPolicy = DEFAULT_AUTO_POLICY) {
-  const text = stripSystemNoise(prompt).toLowerCase();
-  if (/^只回复\s*(ok|yes|no|状态)?$/.test(text) || /^只返回\s*(ok|yes|no|状态|路径)?$/.test(text) || /只回复ok|只返回ok|只返回 yes|只返回 no|只返回状态/.test(text)) {
-    return 'off';
-  }
-  const planningKeywords = autoPolicy.planningKeywords || DEFAULT_AUTO_POLICY.planningKeywords;
-  const implementationKeywords = autoPolicy.implementationKeywords || DEFAULT_AUTO_POLICY.implementationKeywords;
-  const simpleKeywords = autoPolicy.simpleKeywords || DEFAULT_AUTO_POLICY.simpleKeywords;
-  const reviewKeywords = autoPolicy.reviewKeywords || DEFAULT_AUTO_POLICY.reviewKeywords;
-  const researchKeywords = autoPolicy.researchKeywords || DEFAULT_AUTO_POLICY.researchKeywords;
-  const score = { off: 0, high: 0, medium: 0, low: 0 };
-  for (const keyword of planningKeywords) if (text.includes(String(keyword).toLowerCase())) score.high += 3;
-  for (const keyword of reviewKeywords) if (text.includes(String(keyword).toLowerCase())) score.high += 2;
-  for (const keyword of researchKeywords) if (text.includes(String(keyword).toLowerCase())) score.high += 2;
-  for (const keyword of implementationKeywords) if (text.includes(String(keyword).toLowerCase())) score.medium += 3;
-  for (const keyword of simpleKeywords) if (text.includes(String(keyword).toLowerCase())) {
-    score.low += 4;
-    score.off += 2;
-  }
-  if (text.length > 1400) score.high += 2;
-  if (/只回复|一句话|只要结果|只返回路径|只返回 yes|只返回 no|只返回 ok|只返回状态/.test(text)) {
-    score.low += 4;
-    score.off += 4;
-  }
-  if (/json|结构化|字段|schema|表格/.test(text)) score.medium += 2;
-  if (/兼容|迁移|排查|性能|瓶颈|根因/.test(text)) score.high += 2;
-  if (score.off >= 4 && score.off >= score.low && score.off >= score.medium && score.off >= score.high) return 'off';
-  if (score.low >= score.medium && score.low >= score.high) return 'low';
-  if (score.high >= score.medium) return 'high';
-  return 'medium';
-}
-
-function resolveBaseLevel(prompt, globalRule, agentRule, modelRule, autoPolicy) {
-  if (agentRule?.mode && normalizeMode(agentRule.mode) !== 'auto') return normalizeLevel(agentRule.level || agentRule.mode, 'low');
-  if (modelRule?.mode && normalizeMode(modelRule.mode) !== 'auto') return normalizeLevel(modelRule.level || modelRule.mode, 'low');
-  if (globalRule?.mode && normalizeMode(globalRule.mode) !== 'auto') return normalizeLevel(globalRule.level || globalRule.mode, 'low');
-  return autoLevelFromPrompt(prompt, autoPolicy);
-}
-
-function resolveBound(rule, field) {
-  return normalizeLevel(rule?.[field], null);
-}
-
-function resolveAllowedLevels(rule) {
-  if (!rule || typeof rule !== 'object') return [];
-  const only = normalizeLevel(rule.only, null);
-  if (only) return [only];
-  return normalizeLevelList(rule.allowedLevels);
-}
-
-function mergeBounds(globalRule, agentRule, modelRule) {
-  const mins = [resolveBound(globalRule, 'minimumLevel'), resolveBound(agentRule, 'minimumLevel'), resolveBound(modelRule, 'minimumLevel')].filter(Boolean);
-  const maxs = [resolveBound(globalRule, 'maximumLevel'), resolveBound(agentRule, 'maximumLevel'), resolveBound(modelRule, 'maximumLevel')].filter(Boolean);
-  const minLevel = mins.length ? THINK_LEVELS[Math.max(...mins.map(levelIndex))] : null;
-  const maxLevel = maxs.length ? THINK_LEVELS[Math.min(...maxs.map(levelIndex))] : null;
-  return { minLevel, maxLevel };
-}
-
-function mergeAllowedLevels(globalRule, agentRule, modelRule) {
-  const sets = [globalRule, agentRule, modelRule].map(resolveAllowedLevels).filter((levels) => levels.length > 0);
-  if (!sets.length) return [];
-  return sets.reduce((acc, current) => acc.filter((level) => current.includes(level)));
-}
-
-function clampToAllowedLevels(level, allowedLevels) {
-  if (!Array.isArray(allowedLevels) || !allowedLevels.length) return level;
-  if (allowedLevels.includes(level)) return level;
-  const currentIndex = levelIndex(level);
-  const ranked = allowedLevels
-    .map((candidate) => ({ candidate, distance: Math.abs(levelIndex(candidate) - currentIndex), idx: levelIndex(candidate) }))
-    .sort((a, b) => a.distance - b.distance || a.idx - b.idx);
-  return ranked[0]?.candidate || level;
-}
-
-function buildDecision({ prompt, agentId, modelRef, pluginCfg }) {
-  const globalRule = {
-    mode: normalizeMode(pluginCfg.defaultMode, 'auto'),
-    level: normalizeLevel(pluginCfg.defaultLevel, 'low'),
-    minimumLevel: normalizeLevel(pluginCfg.minimumLevel, 'off'),
-    maximumLevel: normalizeLevel(pluginCfg.maximumLevel, null),
-  };
-  const agentRule = getRule(pluginCfg.agentRules, agentId) || {};
-  const modelRule = getRule(pluginCfg.modelRules, modelRef) || {};
-  const autoPolicy = pluginCfg.autoPolicy || DEFAULT_AUTO_POLICY;
-  const baseLevel = resolveBaseLevel(prompt, globalRule, agentRule, modelRule, autoPolicy);
-  const { minLevel, maxLevel } = mergeBounds(globalRule, agentRule, modelRule);
-  const boundedLevel = clampLevel(baseLevel, minLevel, maxLevel);
-  const allowedLevels = mergeAllowedLevels(globalRule, agentRule, modelRule);
-  const finalLevel = clampToAllowedLevels(boundedLevel, allowedLevels);
-  return {
+    level,
+    compactionHint: getCompactionHint(level),
     agentId,
-    modelRef,
-    baseLevel,
-    boundedLevel,
-    finalLevel,
-    minLevel,
-    maxLevel,
-    allowedLevels,
-    globalRule,
-    agentRule,
-    modelRule,
+    modelId,
+    kind: promptDecision.kind,
+    explicitDirective: explicit || null,
+    minimumLevel,
+    maximumLevel,
+    reasons,
   };
 }
 
-async function setSessionThinking(agentId, sessionKey, targetLevel) {
+function getSessionsRegistryPath(agentId, pluginConfig = {}) {
+  const agentsRoot = String(pluginConfig.agentsRoot || DEFAULT_AGENTS_ROOT);
+  return path.join(agentsRoot, agentId, 'sessions', 'sessions.json');
+}
+
+function getSessionEntry(agentId, sessionKey, pluginConfig = {}) {
+  const registryPath = getSessionsRegistryPath(agentId, pluginConfig);
+  const registry = readJson(registryPath, {});
+  if (!registry || typeof registry !== 'object') {
+    return { registryPath, registry: {}, sessionEntry: null };
+  }
+  return {
+    registryPath,
+    registry,
+    sessionEntry: registry[sessionKey] || null,
+  };
+}
+
+function getLastJsonlEventId(sessionFile) {
   try {
-    const storePath = resolveStorePath(undefined, { agentId });
-    if (!storePath) return { updated: false, reason: 'missing-store-path' };
-    return await updateSessionStore(storePath, (store) => {
-      const entry = store?.[sessionKey];
-      if (!entry) return { updated: false, reason: 'missing-session-entry' };
-      const current = normalizeLevel(entry.thinkingLevel, null);
-      if (current === targetLevel) return { updated: false, reason: 'unchanged' };
-      entry.thinkingLevel = targetLevel;
-      return { updated: true, previous: current, next: targetLevel };
-    });
-  } catch (error) {
-    return { updated: false, reason: 'update-failed', error: error.message };
+    const text = fs.readFileSync(sessionFile, 'utf8').trim();
+    if (!text) return null;
+    const lines = text.split('\n').filter(Boolean);
+    if (!lines.length) return null;
+    // Safely parse only the last line with try-catch
+    let last;
+    try {
+      last = JSON.parse(lines[lines.length - 1]);
+    } catch {
+      return null; // Corrupted last line - treat as no valid id
+    }
+    return last?.id || null;
+  } catch {
+    return null;
   }
 }
 
-async function applyThinkingDecision(event, ctx, pluginCfg, phase, prompt) {
-  const agentId = resolveEventAgentId(event, ctx);
-  const sessionKey = resolveSessionKey(event, ctx);
-  if (!prompt || !agentId || !sessionKey) return null;
-  if (pluginCfg.respectExplicitThinkDirective !== false && hasExplicitThinkDirective(prompt)) {
-    const skipped = {
-      skipped: true,
-      reason: 'explicit-think-directive',
-      phase,
-      agentId,
-      sessionKey,
-      at: new Date().toISOString(),
+function appendThinkingLevelEvent(sessionFile, level) {
+  if (!sessionFile) return;
+  try {
+    ensureDir(sessionFile);
+    const event = {
+      type: 'thinking_level_change',
+      id: randomId(),
+      parentId: getLastJsonlEventId(sessionFile),
+      timestamp: new Date().toISOString(),
+      thinkingLevel: level,
     };
-    writeJson(previewFileFor(pluginCfg), skipped);
-    return skipped;
+    fs.appendFileSync(sessionFile, `${JSON.stringify(event)}\n`, 'utf8');
+  } catch {
+    // Best effort only. Session patching should not break dispatch.
   }
-  const cfg = loadConfig();
-  const { providerModelRef } = resolveConfigAgentModel(cfg, agentId);
-  const decision = buildDecision({
-    prompt,
-    agentId,
-    modelRef: providerModelRef,
-    pluginCfg,
-  });
-  const result = await setSessionThinking(agentId, sessionKey, decision.finalLevel);
-  const preview = {
-    ...decision,
-    phase,
-    sessionKey,
-    sessionUpdate: result,
-    at: new Date().toISOString(),
-  };
-  writeJson(previewFileFor(pluginCfg), preview);
-  return preview;
 }
+
+function patchSessionThinkingLevel(agentId, sessionKey, level, pluginConfig = {}) {
+  if (!sessionKey) return { updated: false, reason: 'missing_session_key' };
+  const { registryPath, registry, sessionEntry } = getSessionEntry(agentId, sessionKey, pluginConfig);
+  if (!sessionEntry) return { updated: false, reason: 'session_not_found', registryPath };
+  if (sessionEntry.thinkingLevel === level) {
+    return {
+      updated: false,
+      reason: 'already_set',
+      registryPath,
+      sessionFile: sessionEntry.sessionFile || null,
+    };
+  }
+  const nextRegistry = { ...registry };
+  const nextEntry = {
+    ...sessionEntry,
+    thinkingLevel: level,
+    updatedAt: Date.now(),
+  };
+  nextRegistry[sessionKey] = nextEntry;
+  writeJsonAtomic(registryPath, nextRegistry);
+  appendThinkingLevelEvent(nextEntry.sessionFile, level);
+  return {
+    updated: true,
+    registryPath,
+    sessionFile: nextEntry.sessionFile || null,
+  };
+}
+
+function writePreview(pluginConfig, payload) {
+  const previewFile = String(pluginConfig.previewFile || DEFAULT_PREVIEW);
+  writeJsonAtomic(previewFile, payload);
+  return previewFile;
+}
+
+function appendHistory(pluginConfig, payload) {
+  const historyFile = String(pluginConfig.historyFile || DEFAULT_HISTORY);
+  ensureDir(historyFile);
+  fs.appendFileSync(historyFile, `${JSON.stringify(payload)}\n`, 'utf8');
+  return historyFile;
+}
+
+function readRecentHistory(pluginConfig, limit = 10) {
+  const historyFile = String(pluginConfig.historyFile || DEFAULT_HISTORY);
+  try {
+    const text = fs.readFileSync(historyFile, 'utf8').trim();
+    if (!text) return [];
+    const lines = text.split('\n').filter(Boolean);
+    return lines.slice(-limit).map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+function buildPreviewPayload(event, ctx, pluginConfig, decision, patchResult, skipped) {
+  const prompt = getPromptText(event);
+  return {
+    timestamp: new Date().toISOString(),
+    skipped,
+    sessionKey: resolveSessionKey(event, ctx),
+    agentId: resolveAgentId(event, ctx),
+    modelId: resolveModelId(event, ctx),
+    promptPreview: prompt.slice(0, 500),
+    decision,
+    patchResult,
+  };
+}
+
+function buildHistoryPayload(event, ctx, decision, patchResult, skipped) {
+  const prompt = getPromptText(event);
+  return {
+    timestamp: new Date().toISOString(),
+    skipped,
+    sessionKey: resolveSessionKey(event, ctx),
+    agentId: resolveAgentId(event, ctx),
+    modelId: resolveModelId(event, ctx),
+    promptHash: crypto.createHash('sha1').update(prompt).digest('hex'),
+    promptPreview: prompt.slice(0, 200),
+    decision,
+    patchResult,
+  };
+}
+
+function buildBriefArtifactPath(pluginConfig = {}, agentId, sessionKey) {
+  const briefsDir = String(pluginConfig.briefsDir || DEFAULT_BRIEFS_DIR);
+  const sessionLabel = sessionKey || 'no-session';
+  return path.join(
+    briefsDir,
+    safeSlug(agentId || 'main', 'main'),
+    `${safeSlug(sessionLabel)}-${hashText(sessionLabel).slice(0, 10)}.json`
+  );
+}
+
+function writeBriefArtifact(pluginConfig, event, ctx, decision) {
+  const prompt = getPromptText(event);
+  const agentId = resolveAgentId(event, ctx);
+  const sessionKey = resolveSessionKey(event, ctx);
+  const modelId = resolveModelId(event, ctx);
+  const artifactPath = buildBriefArtifactPath(pluginConfig, agentId, sessionKey);
+  const artifactPayload = {
+    version: '1.0',
+    kind: 'safe-task-brief',
+    generated_at: new Date().toISOString(),
+    sessionKey,
+    agentId,
+    modelId,
+    promptHash: hashText(prompt),
+    promptPreview: prompt.slice(0, 500),
+    decision,
+    brief: buildSafeTaskBrief(prompt, decision),
+  };
+  writeJsonAtomic(artifactPath, artifactPayload);
+  return {
+    type: 'json',
+    kind: 'safe-task-brief',
+    version: '1.0',
+    path: artifactPath,
+    sessionKey,
+    agentId,
+  };
+}
+
+const VERSION = '2.0.1';
 
 const plugin = {
+  version: VERSION,
+
   register(api) {
-    api.logger.info?.('[openclaw-thinking-orchestrator] plugin registered');
+    api.logger.info?.(`[openclaw-thinking-orchestrator] v${VERSION} plugin registered`);
 
     api.registerTool({
       name: 'thinking_orchestrator_status',
       label: 'Thinking Orchestrator Status',
-      description: 'Inspect the latest thinking level decision applied by the orchestrator.',
+      description: 'Read the latest thinking decision preview and current session level.',
       parameters: { type: 'object', properties: {}, required: [] },
       execute: async () => {
-        const file = previewFileFor(api.pluginConfig || {});
-        const details = readJson(file, null);
+        const preview = readJson(String(api.pluginConfig?.previewFile || DEFAULT_PREVIEW), null);
         return {
-          content: [{ type: 'text', text: details ? `thinking=${details.finalLevel || details.reason} agent=${details.agentId || 'main'}` : 'no decision yet' }],
-          details: { success: true, details },
+          content: [
+            {
+              type: 'text',
+              text: preview
+                ? `thinking=${preview?.decision?.level || 'unknown'} agent=${preview?.agentId || 'unknown'} skipped=${Boolean(preview?.skipped)}`
+                : 'no thinking preview yet',
+            },
+          ],
+          details: { success: true, preview },
         };
       },
     });
 
     api.registerTool({
-      name: 'goal_compiler_status',
-      label: 'Goal Compiler Status',
-      description: 'Inspect the latest compiled execution brief managed by the merged orchestrator.',
-      parameters: { type: 'object', properties: {}, required: [] },
-      execute: async () => {
-        const details = readJson(goalPreviewFileFor(api.pluginConfig || {}), null);
+      name: 'thinking_orchestrator_recent',
+      label: 'Thinking Orchestrator Recent',
+      description: 'Read the recent thinking decisions transcript.',
+      parameters: {
+        type: 'object',
+        properties: {
+          limit: { type: 'number' },
+        },
+        required: [],
+      },
+      execute: async (args = {}) => {
+        const limit = Math.max(1, Math.min(20, Number(args?.limit || 5)));
+        const history = readRecentHistory(api.pluginConfig || {}, limit);
         return {
-          content: [{ type: 'text', text: details ? `goal=${details.goal?.taskKind || 'general'} agent=${details.agentId || 'main'}` : 'no goal preview yet' }],
-          details: { success: true, details },
+          content: [{ type: 'text', text: history.length ? `recent=${history.length}` : 'no thinking history yet' }],
+          details: { success: true, history },
+        };
+      },
+    });
+
+    api.registerTool({
+      name: 'thinking_orchestrator_analyze',
+      label: 'Thinking Orchestrator Analyze',
+      description: 'Analyze a prompt and return the safe thinking-level decision.',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string' },
+          agentId: { type: 'string' },
+          modelId: { type: 'string' },
+        },
+        required: ['prompt'],
+      },
+      execute: async (args = {}) => {
+        const prompt = String(args?.prompt || '');
+        const decision = buildDecision(prompt, {
+          config: api.pluginConfig || {},
+          agentId: String(args?.agentId || 'main'),
+          modelId: String(args?.modelId || ''),
+        });
+        return {
+          content: [{ type: 'text', text: `thinking=${decision.level} compaction=${decision.compactionHint} kind=${decision.kind}` }],
+          details: { success: true, decision },
+        };
+      },
+    });
+
+    api.registerTool({
+      name: 'thinking_orchestrator_brief',
+      label: 'Thinking Orchestrator Brief',
+      description: 'Read the latest safe task brief artifact for a session or agent.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sessionKey: { type: 'string' },
+          agentId: { type: 'string' },
+        },
+        required: [],
+      },
+      execute: async (args = {}) => {
+        const agentId = String(args?.agentId || 'main');
+        const preview = readJson(String(api.pluginConfig?.previewFile || DEFAULT_PREVIEW), null);
+        const requestedSessionKey = String(args?.sessionKey || '');
+        const sessionKey = requestedSessionKey || String(preview?.sessionKey || '');
+        const artifactPath = buildBriefArtifactPath(api.pluginConfig || {}, agentId, sessionKey);
+        const artifact = readJson(artifactPath, null);
+        return {
+          content: [{
+            type: 'text',
+            text: artifact
+              ? `brief=${artifact.brief?.workType || 'unknown'} level=${artifact.decision?.level || 'unknown'} compaction=${artifact.decision?.compactionHint || artifact.brief?.compactionHint || 'auto'}`
+              : 'no task brief yet',
+          }],
+          details: { success: true, artifact, artifactPath },
         };
       },
     });
 
     api.on('before_dispatch', async (event, ctx) => {
-      const pluginCfg = api.pluginConfig || {};
-      if (pluginCfg.enabled === false) return;
-      const prompt = getDispatchText(event);
-      await applyThinkingDecision(event, ctx, pluginCfg, 'before_dispatch', prompt);
-    });
-
-    api.on('before_prompt_build', async (event, ctx) => {
-      const pluginCfg = api.pluginConfig || {};
-      if (pluginCfg.enabled === false) return;
-
+      if (api.pluginConfig?.enabled === false) return;
       const prompt = getPromptText(event);
-      await applyThinkingDecision(event, ctx, pluginCfg, 'before_prompt_build', prompt);
-
-      if (!isGoalInjectionEnabled(pluginCfg)) return;
-      const agentId = resolveEventAgentId(event, ctx);
-      if (agentId !== 'main') return;
       const sessionKey = resolveSessionKey(event, ctx);
-      if (!sessionKey || shouldSkipGoal(prompt)) return;
+      const skipped = isInternalControlPrompt(prompt, sessionKey);
+      const agentId = resolveAgentId(event, ctx);
+      const modelId = resolveModelId(event, ctx);
 
-      const goal = compileGoal(prompt, Number(pluginCfg.goalMaxConstraints || 6));
-      writeJson(goalPreviewFileFor(pluginCfg), {
-        generatedAt: new Date().toISOString(),
+      if (skipped) {
+        const preview = buildPreviewPayload(event, ctx, api.pluginConfig || {}, null, null, true);
+        writePreview(api.pluginConfig || {}, preview);
+        appendHistory(api.pluginConfig || {}, buildHistoryPayload(event, ctx, null, null, true));
+        return;
+      }
+
+      const decision = buildDecision(prompt, {
+        config: api.pluginConfig || {},
         agentId,
-        sessionKey,
-        phase: 'plan-execute-report',
-        fingerprint: promptFingerprint(goal),
-        goal,
+        modelId,
       });
-      return {
-        prependContext: formatExecutionBrief(goal),
+
+      // Dynamic degradation: adjust level based on context and complexity
+      const remainingTokens = event?.remainingTokens || ctx?.remainingTokens || 999999;
+      const dynamicConfig = api.pluginConfig?.dynamicDegrade || {};
+      const dynamicDecision = makeDynamicDecision(
+        decision.level,
+        remainingTokens,
+        prompt,
+        dynamicConfig
+      );
+
+      // Use degraded level if different
+      if (dynamicDecision.degraded) {
+        decision.level = dynamicDecision.finalLevel;
+        decision.reasons.push(`dynamic_degrade:${dynamicDecision.reason}`);
+        api.logger.info?.(`[thinking-orchestrator] ${formatDegradeLog(dynamicDecision)}`);
+      }
+
+      const patchResult = patchSessionThinkingLevel(agentId, sessionKey, decision.level, api.pluginConfig || {});
+      const artifactRef = writeBriefArtifact(api.pluginConfig || {}, event, ctx, decision);
+      const preview = {
+        ...buildPreviewPayload(event, ctx, api.pluginConfig || {}, decision, patchResult, false),
+        artifactRef,
+        dynamicDecision, // Include dynamic decision info for debugging
       };
+      writePreview(api.pluginConfig || {}, preview);
+      appendHistory(api.pluginConfig || {}, {
+        ...buildHistoryPayload(event, ctx, decision, patchResult, false),
+        artifactRef,
+      });
     });
   },
 };
 
-plugin.__private = {
-  buildDecision,
-  compileGoal,
-  formatExecutionBrief,
-  promptFingerprint,
-  isGoalInjectionEnabled,
-  stripInternalControlBlocks,
-  isInternalControlPayload,
-};
-
 module.exports = plugin;
+module.exports.VERSION = VERSION;

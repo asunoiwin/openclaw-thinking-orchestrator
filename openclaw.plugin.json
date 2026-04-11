@@ -1,8 +1,8 @@
 {
   "id": "openclaw-thinking-orchestrator",
   "name": "OpenClaw Thinking Orchestrator",
-  "version": "1.0.0",
-  "description": "Merged execution orchestrator: applies thinking policies and injects a compact execution brief for main-agent tasks.",
+  "version": "2.0.0",
+  "description": "Claude-inspired thinking-level decisions with explicit runtime status and no prompt injection.",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -18,20 +18,13 @@
         "type": "string",
         "default": "low"
       },
-      "injectGoalBrief": {
-        "type": "boolean",
-        "default": true
-      },
-      "goalMaxConstraints": {
-        "type": "number",
-        "default": 6
-      },
       "minimumLevel": {
         "type": "string",
         "default": "off"
       },
       "maximumLevel": {
-        "type": "string"
+        "type": "string",
+        "default": "high"
       },
       "respectExplicitThinkDirective": {
         "type": "boolean",
@@ -40,17 +33,17 @@
       "previewFile": {
         "type": "string"
       },
-      "goalPreviewFile": {
+      "briefsDir": {
         "type": "string"
-      },
-      "autoPolicy": {
-        "type": "object"
       },
       "agentRules": {
         "type": "object"
       },
       "modelRules": {
         "type": "object"
+      },
+      "agentsRoot": {
+        "type": "string"
       }
     }
   }
