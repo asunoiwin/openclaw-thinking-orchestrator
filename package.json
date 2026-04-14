@@ -1,6 +1,6 @@
 {
   "name": "openclaw-thinking-orchestrator",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Safe thinking-level orchestration for OpenClaw without prompt injection.",
   "private": true,
   "type": "commonjs",
